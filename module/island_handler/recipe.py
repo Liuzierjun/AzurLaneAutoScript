@@ -16,6 +16,7 @@ from module.exception import GameTooManyClickError
 from module.island.data import DIC_ISLAND_ITEM, DIC_ISLAND_RECIPE, DIC_ISLAND_SHOP_ITEM_TO_RECIPE, DIC_ISLAND_SLOT
 from module.island.utils import (
     ceil_div_or_ceil,
+    ceil_with_epsilon,
     get_idle_accumulating_batch_count,
     get_task_target_items,
     get_target_stock_load_rate,
@@ -27,7 +28,7 @@ from module.island.utils import (
     recipe_name_with_id,
 )
 from module.island_handler.assets import *
-from module.island_handler.exchange import IslandExchange
+from module.island_handler.exchange import FISH_MEAT_SOURCES, IslandExchange
 from module.island_handler.restaurant_config import get_menu_reserve_items
 from module.island_handler.shop import IslandShop
 from module.logger import logger
@@ -132,9 +133,10 @@ def format_recipe_with_product(recipe_id):
 
 # demand is always the parsed [(count, period), ...] list from parse_item_need_deadlines.
 # daily_buffer is the merged LP + manual buffer width contained in target_stock.
+# hard_floor is the HardFloorItems amount contained in target_stock.
 RecipeInfo = namedtuple('RecipeInfo', [
-    'stock', 'target_stock', 'daily_buffer', 'batch_size', 'demand', 'idle_accumulating',
-])
+    'stock', 'target_stock', 'daily_buffer', 'batch_size', 'demand', 'idle_accumulating', 'hard_floor',
+], defaults=(0,))
 
 
 def get_target_stock_weight(stock, target_stock, daily_buffer):
@@ -152,6 +154,24 @@ def get_target_stock_replenish_workload(stock, target_stock, batch_size, workloa
         return 0
     delta_batch = ceil_div_or_ceil(target_stock - stock, batch_size)
     return delta_batch * workload
+
+
+def get_fish_meat_shortage_rate(meat_stock, meat_target, meat_buffer):
+    """
+    Share of the fish daily buffer to produce, by the fish meat the fish is exchanged into.
+
+    Args:
+        meat_stock (int): Fish meat owned, None if unknown.
+        meat_target (int): Target stock of the fish meat, its daily buffer included.
+        meat_buffer (int): Daily buffer of the fish meat.
+
+    Returns:
+        float: 1 if a whole buffer of fish meat is missing or its stock is unknown,
+            0 if fish meat reaches its target, linear in between.
+    """
+    if meat_stock is None or meat_buffer <= 0:
+        return 1.
+    return min(max((meat_target - meat_stock) / meat_buffer, 0.), 1.)
 
 
 def get_demand_weight(stock, target_stock, batch_size, demand):
@@ -176,6 +196,8 @@ RECIPE_MODE_IDLE_ACCUMULATING = 'idle_accumulating'
 def get_recipe_entry_weight(recipe_id, info):
     workload = DIC_ISLAND_RECIPE[recipe_id]['workload']
     return (
+        # Products below their hard floor are produced before anything else
+        info.stock < info.hard_floor,
         get_demand_weight(info.stock, info.target_stock, info.batch_size, info.demand),
         get_target_stock_weight(info.stock, info.target_stock, info.daily_buffer),
         -get_target_stock_replenish_workload(
@@ -374,6 +396,33 @@ class IslandRecipe(IslandExchange, IslandShop):
     def reserve_items(self):
         return get_menu_reserve_items(self.config)
 
+    def get_fish_buffer_rates(self, hard_floor_items, reserve_items, daily_buffer_items, task_target_items):
+        """
+        Fish are only exchanged into fish meat, so the fish daily buffer is
+        produced in proportion to the fish meat still missing.
+
+        Returns:
+            dict: {fish id: share of its daily buffer to produce}
+        """
+        fish_meat_stock = getattr(self, 'fish_meat_stock', {})
+        rates = {}
+        for meat_id, sources in FISH_MEAT_SOURCES.items():
+            meat_buffer = daily_buffer_items.get(meat_id, 0)
+            meat_target = get_production_target_stock(
+                hard_floor_items.get(meat_id, 0),
+                reserve_items.get(meat_id, 0),
+                meat_buffer,
+            ) + max(task_target_items.get(meat_id, {}).get('total_need_count', 0), 0)
+            meat_stock = fish_meat_stock.get(meat_id)
+            rate = get_fish_meat_shortage_rate(meat_stock, meat_target, meat_buffer)
+            logger.info(
+                f'{item_name_with_id(meat_id)} stock: {meat_stock}, target_stock: {meat_target}, '
+                f'fish daily buffer rate: {rate:.3f}'
+            )
+            for fish_id in sources:
+                rates[fish_id] = rate
+        return rates
+
     def get_recipe_id_sequence_to_run(
             self,
             daily_buffer_items_dict=None,
@@ -415,12 +464,16 @@ class IslandRecipe(IslandExchange, IslandShop):
         idle_accumulating_items_dict = normalize_item_keys(idle_accumulating_items_dict)
 
         self.production_floor_items = hard_floor_items_dict, reserve_items_dict, daily_buffer_items_dict
+        fish_buffer_rates = self.get_fish_buffer_rates(
+            hard_floor_items_dict, reserve_items_dict, daily_buffer_items_dict, task_target_items_dict)
         self.recipe_info_by_id = {}
         for recipe_id, stock in stocks_dict.items():
             recipe_product = DIC_ISLAND_RECIPE[recipe_id]['commission_product']
             product_id = get_recipe_product_id(recipe_id)
             batch_size = recipe_product[product_id]
             daily_buffer_width = daily_buffer_items_dict.get(product_id, 0)
+            if product_id in fish_buffer_rates:
+                daily_buffer_width = ceil_with_epsilon(daily_buffer_width * fish_buffer_rates[product_id])
             hard_floor = hard_floor_items_dict.get(product_id, 0)
             reserve = reserve_items_dict.get(product_id, 0)
             target_stock = get_production_target_stock(
@@ -435,7 +488,7 @@ class IslandRecipe(IslandExchange, IslandShop):
                 for count, period in demand
             ) or '0 items in 1 days'
             idle_accumulating = idle_accumulating_items_dict.get(product_id, 0)
-            info = RecipeInfo(stock, target_stock, daily_buffer_width, batch_size, demand, idle_accumulating)
+            info = RecipeInfo(stock, target_stock, daily_buffer_width, batch_size, demand, idle_accumulating, hard_floor)
             self.recipe_info_by_id[recipe_id] = info
             logger.info(
                 f'Recipe {format_recipe_with_product(recipe_id)} stock: {stock}, '
@@ -723,7 +776,8 @@ class IslandRecipe(IslandExchange, IslandShop):
                     delta = real_count * counter[1] - available_stock
                     self.ui_back(check_button=page_island_manage.check_button)
                     self.ui_goto_island_shop()
-                    exchange_success = super().island_shop_exchange({ingredient_key: delta})
+                    exchange_success = super().island_shop_exchange(
+                        {ingredient_key: delta}, keep=self.get_fish_keep_items())
                     # Exchange leaves the recipe menu. Return to production management and
                     # restart so the next attempt rescans recipe stocks and ingredient state.
                     self.ui_back(check_button=page_island.check_button)
@@ -889,16 +943,28 @@ class IslandRecipe(IslandExchange, IslandShop):
             self.all_recipe_stocks[old_recipe_id] = new_stock
         self.recipe_id_sequence = self._build_recipe_id_sequence_to_run()
 
-    def run(self, slot_id=None):
+    def run(self, slot_id=None, emotion=float('inf')):
         """
+        Args:
+            emotion: Current worker emotion; Workerjuu has no emotion limit.
+
         Returns:
             target_time (datetime): timestamp of when the recipe will finish, or None if failed to run any recipe
         """
         self.working_slot_id = slot_id
+        available_workload = emotion * 3000
         del_cached_property(self, 'recipe_grid')
         del_cached_property(self, 'recipe_ids')
         while self.recipe_id_sequence:
-            recipe_id, info, mode = self.recipe_id_sequence[0]
+            affordable_sequence = [
+                entry for entry in self.recipe_id_sequence
+                if DIC_ISLAND_RECIPE[entry[0]]['workload'] <= available_workload
+            ]
+            if not affordable_sequence:
+                logger.info(f'No recipe fits worker emotion {emotion}')
+                break
+            recipe_id, info, mode = affordable_sequence[0]
+            workload = DIC_ISLAND_RECIPE[recipe_id]['workload']
             production_limit = DIC_ISLAND_RECIPE[recipe_id]['production_limit']
             if mode == RECIPE_MODE_BUFFER_SURPLUS:
                 batch_count = self.calculate_buffer_surplus_run_count(info)
@@ -918,6 +984,11 @@ class IslandRecipe(IslandExchange, IslandShop):
             if batch_count > production_limit:
                 logger.info(f"Will try to run {production_limit} batches")
                 batch_count = production_limit
+            if workload and available_workload != float('inf'):
+                emotion_batch_limit = int(available_workload // workload)
+                if batch_count > emotion_batch_limit:
+                    logger.info(f'Will try to run {emotion_batch_limit} batches within worker emotion {emotion}')
+                    batch_count = emotion_batch_limit
             result = self.run_recipe(recipe_id, batch_count, mode=mode)
             if result is not None:
                 remain_time, real_count = result
